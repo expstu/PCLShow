@@ -20,6 +20,4 @@ if( PCL_FOUND )
  
   # Additional Dependencies
   target_link_libraries( pcl_show ${PCL_LIBRARIES} )
-
-  install (TARGETS pcl_show DESTINATION bin)
 endif()
