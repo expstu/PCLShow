@@ -1,13 +1,19 @@
 #include <iostream>
+#include <map>
 
 #include <pcl/common/common_headers.h>
 #include <pcl/common/transforms.h>
+#include <pcl/console/parse.h>
+#include <pcl/console/time.h>   // TicToc
+#include <pcl/PolygonMesh.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/io/vtk_lib_io.h>
 #include <pcl/filters/filter.h>
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/visualization/pcl_visualizer.h>
-#include <pcl/console/parse.h>
-#include <pcl/console/time.h>   // TicToc
+#include <pcl/kdtree/kdtree_flann.h>
+
+#include <Eigen/Geometry>
 
 #include <vtkVersion.h>
 #include <vtkTriangleStrip.h>
@@ -29,6 +35,19 @@ struct PCD {
 };
 
 pcl::visualization::PCLVisualizer *viewer;
+
+template<typename PointType>
+void getAABB(pcl::PointCloud<PointType>& cloud, PointType& minP, PointType& maxP) {
+	minP = maxP = cloud[0];
+	for (int i = 1; i < cloud.size(); i++) {
+		minP.x = std::min(cloud[i].x, minP.x);
+		minP.y = std::min(cloud[i].y, minP.y);
+		minP.z = std::min(cloud[i].z, minP.z);
+		maxP.x = std::max(cloud[i].x, maxP.x);
+		maxP.y = std::max(cloud[i].y, maxP.y);
+		maxP.z = std::max(cloud[i].z, maxP.z);
+	}
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 /** \brief Load a set of PCD files that we want to register together
@@ -92,6 +111,7 @@ int main(int argc, char** argv) {
 		m.f_name = "cloud";
 		if (pcl::io::loadPCDFile("out.pcd", *m.cloud) < 0) {
 			PCL_ERROR("Cannot find this file!");
+			system("pause");
 			return -1;
 		}
 		data.push_back(m);
@@ -110,24 +130,198 @@ int main(int argc, char** argv) {
 		}
 	}
 
-	//PointCloud cloud1;
-	//uint8_t r(255), g(15), b(15);
-	//for (float z(-1.0); z <= 1.0; z += 0.05) {
-	//	for (float angle(0.0); angle <= 360.0; angle += 5.0) {
-	//		PointT point;
-	//		point.x = 0.5 * cosf(pcl::deg2rad(angle));
-	//		point.y = sinf(pcl::deg2rad(angle));
-	//		point.z = z;
-	//		r = g = b = static_cast<int>(angle) % 256;
-	//		uint32_t rgb = (static_cast<uint32_t>(r) << 16 |
-	//			static_cast<uint32_t>(g) << 8 | static_cast<uint32_t>(b));
-	//		point.rgb = *reinterpret_cast<float*>(&rgb);
-	//		cloud1.push_back(point);
-	//	}
-	//}
-	//cloud1.width = cloud1.size();
-	//cloud1.height = 1;
-	//cloud1.is_dense = true;
+	PointT minP, maxP;
+	time.tic();
+	getAABB(*cloud, minP, maxP);
+	PCL_INFO("%f,%f,%f,%f,%f,%f time:%f seconds.\n",
+		minP.x, maxP.x, minP.y, maxP.y, minP.z, maxP.z, time.toc() / 1000.0);
+
+	// move data to origin
+	Eigen::Affine3f a;
+	a = Eigen::Translation3f(-(minP.x + maxP.x) / 2, -(minP.y + maxP.y) / 2, -minP.z);
+	pcl::transformPointCloud(*cloud, *cloud, a);
+	minP = pcl::transformPoint(minP, a);
+	maxP = pcl::transformPoint(maxP, a);
+	PCL_INFO("%f,%f,%f,%f,%f,%f ", minP.x, maxP.x, minP.y, maxP.y, minP.z, maxP.z);
+
+	// load model
+	time.tic();
+	pcl::PolygonMesh polygonMesh;
+	pcl::io::loadPolygonFileSTL("cp2017.STL", polygonMesh);
+	std::cout << time.toc() / 1000.0 << 's' << std::endl;
+
+	pcl::PointCloud<pcl::PointXYZ>::Ptr meshCloud(new pcl::PointCloud<pcl::PointXYZ>);
+	fromPCLPointCloud2(polygonMesh.cloud, *meshCloud);
+
+	pcl::PointXYZ minP2, maxP2;
+	time.tic();
+	getAABB(*meshCloud, minP2, maxP2);
+	
+	a = Eigen::AngleAxisf(180 * static_cast<float>(M_PI) / 180, Eigen::Vector3f::UnitY())*
+		Eigen::Translation3f(-(minP2.x + maxP2.x) / 2, -(minP2.y + maxP2.y) / 2, -maxP2.z);
+	pcl::transformPointCloud(*meshCloud, *meshCloud, a);
+	toPCLPointCloud2(*meshCloud, polygonMesh.cloud);
+	getAABB(*meshCloud, minP2, maxP2);
+	PCL_INFO("%f,%f,%f,%f,%f,%f time:%f seconds.\n",
+		minP2.x, maxP2.x, minP2.y, maxP2.y, minP2.z, maxP2.z, time.toc() / 1000.0);
+
+	// load sampled model cloud
+	time.tic();
+	PointCloudWithNormals::Ptr meshSampCloud(new PointCloudWithNormals);
+	if (pcl::io::loadPCDFile("model_cloud.pcl", *meshSampCloud) < 0) {
+		PCL_ERROR("Cannot find this file!");
+		system("pause");
+		return -1;
+	}
+	PCL_INFO("Loaded model cloud in %f seconds.\n", time.toc() / 1000.0);
+
+	//////////////////////////////////////////////////////////////////////////
+	// try to calculate distance
+	//create an index map
+/*
+	time.tic();
+	std::map<uint32_t, size_t> posOfIndices;
+	for (size_t i = 0; i < polygonMesh.polygons.size(); i++) {
+		std::vector<uint32_t> vertices = polygonMesh.polygons[i].vertices;
+		for (size_t j = 0; j < vertices.size(); j++) {
+			posOfIndices.insert(std::pair<uint32_t, size_t>(vertices[j], i));
+		}
+	}
+	PCL_INFO("Map in: %f seconds.\n", time.toc() / 1000.0);*/
+
+/*
+	time.tic();
+	pcl::KdTreeFLANN<pcl::PointXYZ> kdTree;
+	kdTree.setInputCloud(meshCloud);
+	pcl::PointXYZ searchPoint;
+	int K = 3;
+	std::vector<int> pointIdxNKNSearch(K);
+	std::vector<float> pointNKNSquaredDistance(K);
+	std::vector<uint32_t> triFound;
+	Eigen::Vector3f p0(0, 0, 0), p1(0, 0, 0), p2(0, 0, 0), p3(0, 0, 0);
+
+	for (size_t i = 0; i < cloud->size(); i++) {
+		searchPoint.x = cloud->points[i].x;
+		searchPoint.y = cloud->points[i].y;
+		searchPoint.z = cloud->points[i].z;
+		if (kdTree.nearestKSearch(searchPoint, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0) {
+			p0 << searchPoint.x, searchPoint.y, searchPoint.z;
+
+			triFound = polygonMesh.polygons[posOfIndices[pointIdxNKNSearch[0]]].vertices;
+			
+			p1 << meshCloud->points[triFound[0]].x,
+				meshCloud->points[triFound[0]].y,
+				meshCloud->points[triFound[0]].z;
+			p2 << meshCloud->points[triFound[1]].x,
+				meshCloud->points[triFound[1]].y,
+				meshCloud->points[triFound[1]].z;
+			p3 << meshCloud->points[triFound[2]].x,
+				meshCloud->points[triFound[2]].y,
+				meshCloud->points[triFound[2]].z;
+			//PCL_INFO("(%f,%f,%f),(%f,%f,%f),(%f,%f,%f) ", 
+			//	p1(0), p1(1), p1(2), p2(0), p2(1), p2(2), p3(0), p3(1), p3(2));
+			//PCL_INFO("(%f,%f,%f),(%f,%f,%f),(%f,%f,%f) ",
+			//	meshCloud->points[triFound[0]].x, meshCloud->points[triFound[0]].y,	meshCloud->points[triFound[0]].z, 
+			//	meshCloud->points[triFound[1]].x, meshCloud->points[triFound[1]].y, meshCloud->points[triFound[1]].z,
+			//	meshCloud->points[triFound[2]].x, meshCloud->points[triFound[2]].y, meshCloud->points[triFound[2]].z);
+
+/ *
+			// Cannot find any index, it should not happen
+			PCL_ERROR("cannot find this index: %d\n", pointIdxNKNSearch[0]);
+			p1 << meshCloud->points[pointIdxNKNSearch[0]].x,
+				meshCloud->points[pointIdxNKNSearch[0]].y,
+				meshCloud->points[pointIdxNKNSearch[0]].z;
+			p2 << meshCloud->points[pointIdxNKNSearch[1]].x,
+				meshCloud->points[pointIdxNKNSearch[1]].y,
+				meshCloud->points[pointIdxNKNSearch[1]].z;
+			p3 << meshCloud->points[pointIdxNKNSearch[2]].x,
+				meshCloud->points[pointIdxNKNSearch[2]].y,
+				meshCloud->points[pointIdxNKNSearch[2]].z;* /
+
+			// do calculation
+			Eigen::Vector3f n = (p2 - p1).cross(p3 - p1);
+			float dis = (p0 - p1).dot(n.normalized());
+			uint32_t rgb = 255 << 16 | 255 << 8 | 255;
+			if (fabs(dis) > 0.12) {
+				rgb = 255 << 16 | 0 << 8 | 0;
+			}
+			else if (dis >= 0 && dis <= 0.12) {
+				int color = 255 * (dis / 0.12);
+				rgb = 0 << 16 | color << 8 | 0;
+			}
+			else if (dis < 0 && dis >= -0.12) {
+				int color = 255 * (dis / -0.12);
+				rgb = 0 << 16 | 0 << 8 | color;
+			}
+			else { //this should not happen
+				PCL_ERROR("Overestimated value: %f\n", dis);
+			}
+			//PCL_INFO("dis:%f\n", dis);
+			cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+		}
+	}*/
+	
+	time.tic();
+	pcl::KdTreeFLANN<PointNormalT> kdTree;
+	kdTree.setInputCloud(meshSampCloud);
+	PointNormalT searchPoint;
+	int K = 3;
+	std::vector<int> pointIdxNKNSearch(K);
+	std::vector<float> pointNKNSquaredDistance(K);
+	Eigen::Vector3f p0(0, 0, 0), p1(0, 0, 0), p2(0, 0, 0), p3(0, 0, 0), 
+		n1(0, 0, 0), n2(0, 0, 0), n3(0, 0, 0);
+
+	for (size_t i = 0; i < cloud->size(); i++) {
+		searchPoint.x = cloud->points[i].x;
+		searchPoint.y = cloud->points[i].y;
+		searchPoint.z = cloud->points[i].z;
+		if (kdTree.nearestKSearch(searchPoint, K, pointIdxNKNSearch, pointNKNSquaredDistance) > 0) {
+			p0 << searchPoint.x, searchPoint.y, searchPoint.z;
+
+			// Cannot find any index, it should not happen
+			p1 << meshSampCloud->points[pointIdxNKNSearch[0]].x,
+				meshSampCloud->points[pointIdxNKNSearch[0]].y,
+				meshSampCloud->points[pointIdxNKNSearch[0]].z;
+			p2 << meshSampCloud->points[pointIdxNKNSearch[1]].x,
+				meshSampCloud->points[pointIdxNKNSearch[1]].y,
+				meshSampCloud->points[pointIdxNKNSearch[1]].z;
+			p3 << meshSampCloud->points[pointIdxNKNSearch[2]].x,
+				meshSampCloud->points[pointIdxNKNSearch[2]].y,
+				meshSampCloud->points[pointIdxNKNSearch[2]].z;
+			n1 << meshSampCloud->points[pointIdxNKNSearch[0]].normal_x,
+				meshSampCloud->points[pointIdxNKNSearch[0]].normal_y,
+				meshSampCloud->points[pointIdxNKNSearch[0]].normal_z;
+			n2 << meshSampCloud->points[pointIdxNKNSearch[1]].normal_x,
+				meshSampCloud->points[pointIdxNKNSearch[1]].normal_y,
+				meshSampCloud->points[pointIdxNKNSearch[1]].normal_z;
+			n3 << meshSampCloud->points[pointIdxNKNSearch[2]].normal_x,
+				meshSampCloud->points[pointIdxNKNSearch[2]].normal_y,
+				meshSampCloud->points[pointIdxNKNSearch[2]].normal_z;
+
+			// do calculation
+			Eigen::Vector3f n = (n1+n2+n3)/3;
+
+			float dis = (p0 - p1).dot(n.normalized());
+			uint32_t rgb = 255 << 16 | 255 << 8 | 255;
+			if (fabs(dis) > 0.12) {
+				rgb = 255 << 16 | 0 << 8 | 0;
+			}
+			else if (dis >= 0 && dis <= 0.12) {
+				int color = 255 * (dis / 0.12);
+				rgb = 0 << 16 | color << 8 | 0;
+			}
+			else if (dis < 0 && dis >= -0.12) {
+				int color = 255 * (dis / -0.12);
+				rgb = 0 << 16 | 0 << 8 | color;
+			}
+			else { //this should not happen
+				PCL_ERROR("Unexpected value: %f\n", dis);
+			}
+			//PCL_INFO("dis:%f\n", dis);
+			cloud->points[i].rgb = *reinterpret_cast<float*>(&rgb);
+		}
+	}
+	PCL_INFO("calculate distance in: %f seconds.\n", time.toc() / 1000.0);
 
 	// Create a PCLVisualizer object
 	viewer = new pcl::visualization::PCLVisualizer(argc, argv, "Viewer test");
@@ -139,103 +333,20 @@ int main(int argc, char** argv) {
 	//pcl::visualization::PointCloudColorHandlerCustom<pcl::PointXYZRGB> transformed_cloud_color_handler(transformed_cloud, 230, 20, 20); // Red
 	//viewer->addPointCloud(transformed_cloud, transformed_cloud_color_handler, "transformed_cloud");
 
-	double pu0[3] = { -26., 64.9, 15.432 };
-	double pu1[3] = { 26., 65.0, 15.453 };
-	double pu2[3] = { 25.5, -65.9, 15.458 };
-	double pu3[3] = { -25.8, -65.9, 15.5 };
-	double pb0[3] = { -25.9, 64.9, 15.152 };
-	double pb1[3] = { 26., 65.0, 15.163 };
-	double pb2[3] = { 25.5, -65.9, 15.149 };
-	double pb3[3] = { -25.8, -65.9, 15.209 };
-	vtkSmartPointer<vtkPoints> pointsU = vtkSmartPointer<vtkPoints>::New();
-	pointsU->InsertNextPoint(pu0);
-	pointsU->InsertNextPoint(pu1);
-	pointsU->InsertNextPoint(pu3);
-	pointsU->InsertNextPoint(pu2);
-	vtkSmartPointer<vtkPoints> pointsB = vtkSmartPointer<vtkPoints>::New();
-	pointsB->InsertNextPoint(pb0);
-	pointsB->InsertNextPoint(pb1);
-	pointsB->InsertNextPoint(pb3);
-	pointsB->InsertNextPoint(pb2);
+	// Show bounding box of data
+	viewer->addCube(minP.x, maxP.x, minP.y, maxP.y, minP.z, maxP.z, 255, 0, 0, "AABB");
+	viewer->setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_REPRESENTATION,
+		pcl::visualization::PCL_VISUALIZER_REPRESENTATION_WIREFRAME, "AABB");
+	viewer->setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 3.0, "AABB");
 
-	// Setup the colors array
-	uint8_t z0 = static_cast<uint8_t>(zToColor(15.432));
-	uint8_t z1 = static_cast<uint8_t>(zToColor(15.453));
-	uint8_t z2 = static_cast<uint8_t>(zToColor(15.458));
-	uint8_t z3 = static_cast<uint8_t>(zToColor(15.5));
-	uint8_t c0[3] = { z0, z0, z0 };
-	uint8_t c1[3] = { z1, z1, z1 };
-	uint8_t c2[3] = { z2 ,z2 ,z2 };
-	uint8_t c3[3] = { z3 ,z3, z3 };
-	vtkSmartPointer<vtkUnsignedCharArray> colors = vtkSmartPointer<vtkUnsignedCharArray>::New();
-	colors->SetNumberOfComponents(3);
-	colors->SetName("Colors");
-	colors->InsertNextTupleValue(c0);
-	colors->InsertNextTupleValue(c1);
-	colors->InsertNextTupleValue(c3);
-	colors->InsertNextTupleValue(c2);
-	z0 = static_cast<uint8_t>(zToColor(15.152));
-	z1 = static_cast<uint8_t>(zToColor(15.163));
-	z2 = static_cast<uint8_t>(zToColor(15.149));
-	z3 = static_cast<uint8_t>(zToColor(15.209));
-	uint8_t cb0[3] = { z0, z0, z0 };
-	uint8_t cb1[3] = { z1, z1, z1 };
-	uint8_t cb2[3] = { z2 ,z2 ,z2 };
-	uint8_t cb3[3] = { z3 ,z3, z3 };
-	vtkSmartPointer<vtkUnsignedCharArray> colorsB = vtkSmartPointer<vtkUnsignedCharArray>::New();
-	colorsB->SetNumberOfComponents(3);
-	colorsB->SetName("ColorsB");
-	colorsB->InsertNextTupleValue(cb0);
-	colorsB->InsertNextTupleValue(cb1);
-	colorsB->InsertNextTupleValue(cb3);
-	colorsB->InsertNextTupleValue(cb2);
+	// Show model
+	//viewer->addPolygonMesh(polygonMesh, "mesh");
 
-	vtkSmartPointer<vtkTriangleStrip> triangleStripU = vtkSmartPointer<vtkTriangleStrip>::New();
-	triangleStripU->GetPointIds()->SetNumberOfIds(4);
-	triangleStripU->GetPointIds()->SetId(0, 0);
-	triangleStripU->GetPointIds()->SetId(1, 1);
-	triangleStripU->GetPointIds()->SetId(2, 2);
-	triangleStripU->GetPointIds()->SetId(3, 3);
-	vtkSmartPointer<vtkTriangleStrip> triangleStripB = vtkSmartPointer<vtkTriangleStrip>::New();
-	triangleStripB->GetPointIds()->SetNumberOfIds(4);
-	triangleStripB->GetPointIds()->SetId(0, 0);
-	triangleStripB->GetPointIds()->SetId(1, 1);
-	triangleStripB->GetPointIds()->SetId(2, 2);
-	triangleStripB->GetPointIds()->SetId(3, 3);
+	viewer->addCube(minP2.x, maxP2.x, minP2.y, maxP2.y, minP2.z, maxP2.z, 0, 255, 0, "meshAABB");
+	viewer->setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_REPRESENTATION,
+		pcl::visualization::PCL_VISUALIZER_REPRESENTATION_WIREFRAME, "meshAABB");
+	viewer->setShapeRenderingProperties(pcl::visualization::PCL_VISUALIZER_LINE_WIDTH, 3.0, "meshAABB");
 
-	vtkSmartPointer<vtkCellArray> cellsU = vtkSmartPointer<vtkCellArray>::New();
-	cellsU->InsertNextCell(triangleStripU);
-	vtkSmartPointer<vtkCellArray> cellsB = vtkSmartPointer<vtkCellArray>::New();
-	cellsB->InsertNextCell(triangleStripB);
-
-	vtkSmartPointer<vtkPolyData> polyDataU = vtkSmartPointer<vtkPolyData>::New();
-	polyDataU->SetPoints(pointsU);
-	polyDataU->SetStrips(cellsU);
-	polyDataU->GetPointData()->SetScalars(colors);
-	vtkSmartPointer<vtkPolyData> polyDataB = vtkSmartPointer<vtkPolyData>::New();
-	polyDataB->SetPoints(pointsB);
-	polyDataB->SetStrips(cellsB);
-	polyDataB->GetPointData()->SetScalars(colorsB);
-
-	vtkSmartPointer<vtkPolyDataMapper> mapperU = vtkSmartPointer<vtkPolyDataMapper>::New();
-	mapperU->SetInputData(polyDataU);
-	vtkSmartPointer<vtkPolyDataMapper> mapperB = vtkSmartPointer<vtkPolyDataMapper>::New();
-	mapperB->SetInputData(polyDataB);
-	vtkSmartPointer<vtkActor> actorU = vtkSmartPointer<vtkActor>::New();
-	actorU->SetMapper(mapperU);
-	actorU->GetProperty()->SetAmbient(1);
-	actorU->GetProperty()->SetDiffuse(0);// turn off diffuse light
-	vtkSmartPointer<vtkActor> actorB = vtkSmartPointer<vtkActor>::New();
-	actorB->SetMapper(mapperB);
-	actorB->GetProperty()->SetAmbient(1);
-	actorB->GetProperty()->SetDiffuse(0);// turn off diffuse light
-
-	vtkSmartPointer<vtkRenderWindow> vtkRV = viewer->getRenderWindow();
-	vtkSmartPointer<vtkRenderer> renderer = vtkRV->GetRenderers()->GetFirstRenderer();
-
-	renderer->AddActor(actorU);
-	renderer->AddActor(actorB);
-	
 	viewer->addCoordinateSystem(1.0);
 	viewer->initCameraParameters();
 	viewer->setCameraPosition(0.013336, -1.73476, 144.206, -0.999603, 0.0281814, 0.000434471);
